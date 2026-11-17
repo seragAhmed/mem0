@@ -103,16 +103,23 @@ def _update_shell_rc(path: Path, api_key: str) -> bool:
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
-    """Write content to path atomically (temp + rename)."""
-    dirname = path.parent
-    fd, tmp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=dirname)
+    """Write content to an existing file atomically (temp + rename).
+
+    Symlinks are resolved first, so the rename replaces the file a link points
+    to and the link itself stays in place (dotfiles managed by GNU Stow,
+    chezmoi or yadm). Raises if ``path`` no longer resolves to an existing
+    file (removed, or a dangling link): this module never creates files.
+    """
+    target = path.resolve(strict=True)
+    dirname = target.parent
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=dirname)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
         # Preserve mode if the original existed.
-        if path.exists():
-            os.chmod(tmp_path, path.stat().st_mode & 0o777)
-        os.replace(tmp_path, path)
+        if target.exists():
+            os.chmod(tmp_path, target.stat().st_mode & 0o777)
+        os.replace(tmp_path, target)
     except Exception:
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)

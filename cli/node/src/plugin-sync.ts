@@ -95,20 +95,25 @@ export function updateShellRc(filePath: string, apiKey: string): boolean {
 }
 
 function atomicWriteText(filePath: string, content: string): void {
-	const dir = path.dirname(filePath);
-	const tmp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.tmp`);
+	// Resolve symlinks first, so the rename replaces the file a link points to
+	// and the link itself stays in place (dotfiles managed by GNU Stow, chezmoi
+	// or yadm). Throws if filePath no longer resolves to an existing file
+	// (removed, or a dangling link): this module never creates files.
+	const target = fs.realpathSync(filePath);
+	const dir = path.dirname(target);
+	const tmp = path.join(dir, `.${path.basename(target)}.${process.pid}.tmp`);
 	try {
 		fs.writeFileSync(tmp, content, "utf-8");
 		// Preserve permissions if original existed.
-		if (fs.existsSync(filePath)) {
+		if (fs.existsSync(target)) {
 			try {
-				const mode = fs.statSync(filePath).mode & 0o777;
+				const mode = fs.statSync(target).mode & 0o777;
 				fs.chmodSync(tmp, mode);
 			} catch {
 				/* best-effort */
 			}
 		}
-		fs.renameSync(tmp, filePath);
+		fs.renameSync(tmp, target);
 	} catch (err) {
 		try {
 			fs.unlinkSync(tmp);

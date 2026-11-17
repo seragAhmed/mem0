@@ -8,15 +8,33 @@
  *  - `pingKey` must NOT treat network errors as "invalid key" (else a VPN
  *    flap silently mints a new shadow over a working key).
  *  - `plugin_sync` must only update entries that already exist, preserve
- *    trailing newlines, and never mangle other lines.
+ *    trailing newlines, never mangle other lines, and write through a
+ *    symlinked file instead of replacing the link.
  */
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	type TestContext,
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
 import { pingKey } from "../src/commands/init.js";
 import { updateClaudeSettings, updateShellRc } from "../src/plugin-sync.js";
+
+/** Creating a symlink needs a privilege on Windows; skip there rather than fail. */
+function symlinkOrSkip(ctx: TestContext, target: string, link: string): void {
+	try {
+		fs.symlinkSync(target, link);
+	} catch (err) {
+		ctx.skip(`symlinks unavailable: ${(err as Error).message}`);
+	}
+}
 
 // ── pingKey ──────────────────────────────────────────────────────────────
 
@@ -110,6 +128,35 @@ describe("updateShellRc — exists-only contract", () => {
 		const rc = path.join(tmpDir, ".zshrc"); // does not exist
 		expect(updateShellRc(rc, "x")).toBe(false);
 	});
+
+	it("keeps a symlinked rc file a symlink and updates its target", (ctx) => {
+		// Dotfile managers (GNU Stow, chezmoi, yadm) symlink ~/.zshrc into a repo.
+		const dotfiles = path.join(tmpDir, "dotfiles");
+		fs.mkdirSync(dotfiles);
+		const real = path.join(dotfiles, "zshrc");
+		fs.writeFileSync(real, '# managed\nexport MEM0_API_KEY="old"\n');
+		const rc = path.join(tmpDir, ".zshrc");
+		symlinkOrSkip(ctx, path.join("dotfiles", "zshrc"), rc);
+
+		expect(updateShellRc(rc, "newkey")).toBe(true);
+
+		expect(fs.lstatSync(rc).isSymbolicLink()).toBe(true);
+		expect(fs.readlinkSync(rc)).toBe(path.join("dotfiles", "zshrc"));
+		expect(fs.readFileSync(real, "utf-8")).toBe(
+			'# managed\nexport MEM0_API_KEY="newkey"\n',
+		);
+		expect(fs.readdirSync(dotfiles)).toEqual(["zshrc"]); // no temp file left
+	});
+
+	it("leaves a dangling symlink alone", (ctx) => {
+		const rc = path.join(tmpDir, ".zshrc");
+		symlinkOrSkip(ctx, path.join("dotfiles", "zshrc"), rc); // target does not exist
+
+		expect(updateShellRc(rc, "newkey")).toBe(false);
+
+		expect(fs.lstatSync(rc).isSymbolicLink()).toBe(true);
+		expect(fs.existsSync(path.join(tmpDir, "dotfiles"))).toBe(false);
+	});
 });
 
 // ── updateClaudeSettings ─────────────────────────────────────────────────
@@ -149,6 +196,32 @@ describe("updateClaudeSettings — never creates entries", () => {
 		const data = JSON.parse(fs.readFileSync(settings, "utf-8"));
 		expect(data.env.MEM0_API_KEY).toBe("fresh");
 		expect(data.env.OTHER).toBe("y");
+	});
+
+	it("keeps a symlinked settings.json a symlink and updates its target", (ctx) => {
+		const dotfiles = path.join(tmpDir, "dotfiles");
+		fs.mkdirSync(dotfiles);
+		const real = path.join(dotfiles, "claude-settings.json");
+		fs.writeFileSync(
+			real,
+			JSON.stringify({ env: { MEM0_API_KEY: "old", OTHER: "y" } }, null, 2),
+		);
+		fs.chmodSync(real, 0o600);
+		const modeBefore = fs.statSync(real).mode & 0o777;
+		const claudeDir = path.join(tmpDir, ".claude");
+		fs.mkdirSync(claudeDir);
+		const settings = path.join(claudeDir, "settings.json");
+		const linkTarget = path.join("..", "dotfiles", "claude-settings.json");
+		symlinkOrSkip(ctx, linkTarget, settings);
+
+		expect(updateClaudeSettings(settings, "fresh")).toBe(true);
+
+		expect(fs.lstatSync(settings).isSymbolicLink()).toBe(true);
+		expect(fs.readlinkSync(settings)).toBe(linkTarget);
+		const data = JSON.parse(fs.readFileSync(real, "utf-8"));
+		expect(data.env).toEqual({ MEM0_API_KEY: "fresh", OTHER: "y" });
+		expect(fs.statSync(real).mode & 0o777).toBe(modeBefore);
+		expect(fs.readdirSync(dotfiles)).toEqual(["claude-settings.json"]);
 	});
 
 	it("is idempotent when value already matches", () => {

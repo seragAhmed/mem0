@@ -6,7 +6,8 @@ These tests exercise the units that the high-level subprocess parity tests in
   - ``_ping_key`` must NOT treat network errors as "invalid key" (else a VPN
     flap silently mints a new shadow over a working key).
   - ``plugin_sync`` must only update entries that already exist, preserve
-    trailing newlines, and never mangle other lines.
+    trailing newlines, never mangle other lines, and write through a
+    symlinked file instead of replacing the link.
   - The 403→ratelimit translation in ``bootstrap_via_backend`` surfaces the
     real cause instead of DRF's opaque "You do not have permission" string.
 
@@ -16,6 +17,7 @@ behavioral assertion here, mirror it on the Node side and vice versa.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import httpx
@@ -112,6 +114,41 @@ def test_shell_rc_missing_file_is_noop(tmp_path) -> None:
     assert _update_shell_rc(rc, "x") is False
 
 
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    # Creating a symlink needs a privilege on Windows; skip there rather than fail.
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+
+def test_shell_rc_symlink_stays_a_symlink_and_target_is_updated(tmp_path) -> None:
+    # Dotfile managers (GNU Stow, chezmoi, yadm) symlink ~/.zshrc into a repo.
+    dotfiles = tmp_path / "dotfiles"
+    dotfiles.mkdir()
+    real = dotfiles / "zshrc"
+    real.write_text('# managed\nexport MEM0_API_KEY="old"\n', encoding="utf-8")
+    rc = tmp_path / ".zshrc"
+    _symlink_or_skip(rc, Path("dotfiles", "zshrc"))
+
+    assert _update_shell_rc(rc, "newkey") is True
+
+    assert rc.is_symlink()
+    assert rc.readlink() == Path("dotfiles", "zshrc")
+    assert real.read_text(encoding="utf-8") == '# managed\nexport MEM0_API_KEY="newkey"\n'
+    assert sorted(p.name for p in dotfiles.iterdir()) == ["zshrc"]  # no temp file left
+
+
+def test_shell_rc_dangling_symlink_is_left_alone(tmp_path) -> None:
+    rc = tmp_path / ".zshrc"
+    _symlink_or_skip(rc, Path("dotfiles", "zshrc"))  # target does not exist
+
+    assert _update_shell_rc(rc, "newkey") is False
+
+    assert rc.is_symlink()
+    assert not (tmp_path / "dotfiles").exists()
+
+
 # ── plugin_sync._update_claude_settings ────────────────────────────────────
 
 
@@ -148,6 +185,33 @@ def test_claude_settings_updates_existing_entry(tmp_path) -> None:
     data = json.loads(settings.read_text(encoding="utf-8"))
     assert data["env"]["MEM0_API_KEY"] == "fresh"
     assert data["env"]["OTHER"] == "y"  # other keys preserved
+
+
+def test_claude_settings_symlink_stays_a_symlink_and_target_is_updated(tmp_path) -> None:
+    import json
+
+    dotfiles = tmp_path / "dotfiles"
+    dotfiles.mkdir()
+    real = dotfiles / "claude-settings.json"
+    real.write_text(
+        json.dumps({"env": {"MEM0_API_KEY": "old", "OTHER": "y"}}, indent=2),
+        encoding="utf-8",
+    )
+    real.chmod(0o600)
+    mode_before = real.stat().st_mode & 0o777
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    settings = claude_dir / "settings.json"
+    _symlink_or_skip(settings, Path("..", "dotfiles", "claude-settings.json"))
+
+    assert _update_claude_settings(settings, "fresh") is True
+
+    assert settings.is_symlink()
+    assert settings.readlink() == Path("..", "dotfiles", "claude-settings.json")
+    data = json.loads(real.read_text(encoding="utf-8"))
+    assert data["env"] == {"MEM0_API_KEY": "fresh", "OTHER": "y"}
+    assert real.stat().st_mode & 0o777 == mode_before
+    assert sorted(p.name for p in dotfiles.iterdir()) == ["claude-settings.json"]
 
 
 def test_claude_settings_idempotent(tmp_path) -> None:
